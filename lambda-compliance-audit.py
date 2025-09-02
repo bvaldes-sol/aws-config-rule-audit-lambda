@@ -6,9 +6,9 @@ import os
 
 def lambda_handler(event, context):
     # Extract parameters from event and environment
-    target_account_id = event.get('target_account_id')
-    s3_bucket = event.get('s3_bucket')
-    s3_rule_list_key = event.get('s3_rule_list_key')  # e.g., 'config/rules.json'
+    target_account_id = os.environ.get('target_account_id')
+    s3_bucket = os.environ.get('s3_bucket')
+    s3_rule_list_key = os.environ.get('s3_rule_list_key')  # e.g., 'config/rules.json'
     aggregator_name = os.environ.get('AGGREGATOR_NAME')
 
     if not all([target_account_id, s3_bucket, s3_rule_list_key, aggregator_name]):
