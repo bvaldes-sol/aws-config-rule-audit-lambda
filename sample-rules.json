@@ -1,0 +1,6 @@
+[
+  "securityhub-multi-region-cloud-trail-enabled",
+  "vpc-flow-logs-enabled",
+  "AWSControlTower_AWS-GR_DETECT_CLOUDTRAIL_ENABLED_ON_SHARED_ACCOUNTS",
+  "s3-bucket-level-public-access-prohibited"
+]
