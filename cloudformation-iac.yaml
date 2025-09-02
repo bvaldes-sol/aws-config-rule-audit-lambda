@@ -1,0 +1,182 @@
+#Note you will see syntax errors (Unkown Tags) in your IDE due to the embedded python code, but it will deploy fine.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploys a Lambda function to check AWS Config rule compliance and export to S3.
+
+Parameters:
+  AggregatorName:
+    Type: String
+    Description: The name of the AWS Config aggregator.
+    Default: YourConfigAggregator  # Replace with your default if needed
+  S3BucketName:
+    Type: String
+    Description: The S3 bucket for rule list JSON and output CSV (must exist already).
+    Default: your-existing-bucket-name  # Replace with your bucket name
+  LambdaFunctionName:
+    Type: String
+    Description: Name for the Lambda function.
+    Default: ConfigRuleAuditLambda # Change as needed
+  AccountID:
+    Type: String
+    Description: (Optional) Target AWS Account ID to check compliance for. If not provided, must be passed in event.
+    Default: '01234567891012'  # Leave empty if you want to pass it via event
+  RulesLocation:
+    Type: String
+    Description: S3 key for the JSON file containing the list of Config rule identifiers.
+    Default: config/rules.json  # Change if your file and directory is in a different location within the s3 bucket.
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole  # For logging
+      Policies:
+        - PolicyName: ConfigAndS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - config:DescribeAggregateComplianceByConfigRules
+                Resource: '*'  # Narrow to your aggregator ARN if possible
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+                  - !Sub arn:aws:s3:::${S3BucketName}  # For bucket-level actions if needed
+
+  ComplianceCheckerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12  # Matches our code's Python version
+      Timeout: 300  # 5 minutes, adjust as needed
+      Environment:
+        Variables:
+          AGGREGATOR_NAME: !Ref AggregatorName
+          s3_bucket: !Ref S3BucketName
+          s3_rule_list_key: !Ref RulesLocation  # Path to the JSON file in S3
+          target_account_id: !Ref AccountID # Optionally set a default target account ID
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import io
+          import json
+          import os
+
+          def lambda_handler(event, context):
+              # Extract parameters from event or environment
+              target_account_id = os.environ.get('target_account_id') #option you can automate with eventbridge event.get('target_account_id')
+              s3_bucket = os.environ.get('s3_bucket')
+              s3_rule_list_key = os.environ.get('s3_rule_list_key')  # e.g., 'config/rules.json'
+              aggregator_name = os.environ.get('AGGREGATOR_NAME')
+
+              if not all([target_account_id, s3_bucket, s3_rule_list_key, aggregator_name]):
+                  raise ValueError("Missing required parameters: target_account_id, s3_bucket, s3_rule_list_key, or AGGREGATOR_NAME")
+
+              # Step 1: Fetch the rule identifiers from the S3 JSON file
+              s3_client = boto3.client('s3')
+              try:
+                  response = s3_client.get_object(Bucket=s3_bucket, Key=s3_rule_list_key)
+                  rule_list_content = response['Body'].read().decode('utf-8')
+                  TARGET_CONFIG_RULE_IDENTIFIERS = json.loads(rule_list_content)
+                  if not isinstance(TARGET_CONFIG_RULE_IDENTIFIERS, list) or not all(isinstance(rule, str) for rule in TARGET_CONFIG_RULE_IDENTIFIERS):
+                      raise ValueError("S3 JSON file must contain a list of strings")
+              except Exception as e:
+                  raise Exception(f"Failed to load or parse rule list from s3://{s3_bucket}/{s3_rule_list_key}: {str(e)}")
+
+              config_client = boto3.client('config')
+
+              # Step 2: Get compliance status for rules in the specified account using aggregator
+              rule_statuses = []
+              next_token = None
+              while True:
+                  api_params = {
+                      'ConfigurationAggregatorName': aggregator_name,
+                      'Filters': {'AccountId': target_account_id}
+                  }
+                  if next_token:
+                      api_params['NextToken'] = next_token
+
+                  response = config_client.describe_aggregate_compliance_by_config_rules(**api_params)
+                  
+                  for rule in response.get('AggregateComplianceByConfigRules', []):
+                      api_rule_name = rule['ConfigRuleName']
+                      for target_identifier in TARGET_CONFIG_RULE_IDENTIFIERS:
+                          if target_identifier in api_rule_name:  # Substring match
+                              compliance = rule.get('Compliance', {})
+                              contributor_count = compliance.get('ComplianceContributorCount', {}).get('CappedCount', 0)
+                              rule_statuses.append({
+                                  'AccountID': rule['AccountId'],
+                                  'AwsRegion': rule['AwsRegion'],
+                                  'ConfigRuleName': api_rule_name,
+                                  'ComplianceType': compliance.get('ComplianceType', 'N/A'),
+                                  'NonCompliantResourceCount': contributor_count if compliance.get('ComplianceType') == 'NON_COMPLIANT' else 0,
+                                  'Note': 'Contributor count is the number of non-compliant resources (capped at 100)' if contributor_count > 0 else ''
+                              })
+                              break  # Found a match, move to next rule
+
+                  next_token = response.get('NextToken')
+                  if not next_token:
+                      break
+
+              # Step 3: Add NOT_FOUND entries for any target rules not in the results
+              found_rules = {rule['ConfigRuleName'] for rule in rule_statuses}
+              for target_identifier in TARGET_CONFIG_RULE_IDENTIFIERS:
+                  if not any(target_identifier in rule_name for rule_name in found_rules):
+                      rule_statuses.append({
+                          'AccountID': target_account_id,
+                          'AwsRegion': 'N/A',
+                          'ConfigRuleName': target_identifier,
+                          'ComplianceType': 'NOT_FOUND',
+                          'NonCompliantResourceCount': 0,
+                          'Note': 'Rule not found in aggregator results'
+                      })
+
+              # Step 4: Export to CSV and upload to S3
+              if rule_statuses:
+                  output = io.StringIO()
+                  writer = csv.DictWriter(output, fieldnames=[
+                      'AccountID', 'AwsRegion', 'ConfigRuleName', 'ComplianceType',
+                      'NonCompliantResourceCount', 'Note'
+                  ])
+                  writer.writeheader()
+                  writer.writerows(rule_statuses)
+                  csv_content = output.getvalue().encode('utf-8')
+
+                  s3_key = f'config_rule_compliance_{target_account_id}.csv'
+                  s3_client.put_object(Body=csv_content, Bucket=s3_bucket, Key=s3_key)
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'CSV uploaded to s3://{s3_bucket}/{s3_key}',
+                          'results': rule_statuses
+                      })
+                  }
+              else:
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'No results found'})
+                  }
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the deployed Lambda function.
+    Value: !GetAtt ComplianceCheckerLambda.Arn
+  LambdaExecutionRoleArn:
+    Description: ARN of the IAM role for the Lambda.
+    Value: !GetAtt LambdaExecutionRole.Arn
